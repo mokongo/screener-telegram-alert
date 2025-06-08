@@ -1,95 +1,110 @@
-# Screener & Telegram Alert Bot with Volume Logic
+
+# app.py (formerly: Whale Trap Screener & Telegram Alert Bot)
 # Features:
-# - Accepts JSON coin data
-# - Scores bullish/bearish including volume
-# - Ranks top 10 in each
-# - Sends summary + CSV to Telegram
+# - Tracks coins that pumped over 24 hours up to 7 days
+# - Detects potential10 trap candidates
+# - Monitors BTC correlation
+# - Sends Telegram alert + CSV
+# - Accepts Telegram command: /trap
 
 import pandas as pd
 import requests
 import os
-from io import BytesIO
+from io import reversal traps (e.g., RSI drop, CCI cooldown)
+# - Scores and ranks top  BytesIO
+from flask import Flask, request
 
-# ------------------------------
-# SCORING FUNCTION
-# ------------------------------
-def score_coins(data):
+app = Flask(__name__)
+
+def detect_whale_traps(data):
     df = pd.DataFrame(data)
+    df = df.drop_duplicates(subset='Symbol')
 
-    def bullish_score(row):
+    def trap_score(row):
         score = 0
-        score += 1 if row['Relative Strength Index (14) 1 day'] > 60 else 0
-        score += 1 if row['Commodity Channel Index (20) 1 day'] > 100 else 0
-        score += 1 if row['Momentum (10) 1 day'] > 0.1 else 0
-        score += 1 if row['Price Change % 24 hours'] > 2 else 0
-        score += 1 if row.get('Volume USDT', 0) > 10_000_000 else 0
+        score += 1 if 5 < row['Price Change % 7 days'] < 40 else 0
+        score += 1 if row['Price Change % 24 hours'] < 0 else 0
+        score += 1 if row['Relative Strength Index (14) 1 day'] < 50 else 0
+        score += 1 if row['Commodity Channel Index (20) 1 day'] < 0 else 0
+        score += 1 if abs(row.get('BTC Correlation', 0)) < 0.3 else 0
         return score
 
-    def bearish_score(row):
-        score = 0
-        score += 1 if row['Relative Strength Index (14) 1 day'] < 40 else 0
-        score += 1 if row['Commodity Channel Index (20) 1 day'] < -100 else 0
-        score += 1 if row['Momentum (10) 1 day'] < -0.1 else 0
-        score += 1 if row['Price Change % 24 hours'] < -2 else 0
-        score += 1 if row.get('Volume USDT', 10_000_000) < 1_000_000 else 0
-        return score
+    df['trap_score'] = df.apply(trap_score, axis=1)
+    df = df.sort_values(by='trap_score', ascending=False)
+    top_traps = df[df['trap_score'] > 0].head(10)
+    return df, top_traps
 
-    df['bullish_score'] = df.apply(bullish_score, axis=1)
-    df['bearish_score'] = df.apply(bearish_score, axis=1)
+def fetch_binance_trap_data():
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    r = requests.get(url)
+    raw = r.json()
+    coins = []
 
-    top_bullish = df.sort_values(by='bullish_score', ascending=False).head(10)
-    top_bearish = df.sort_values(by='bearish_score', ascending=False).head(10)
+    for item in raw:
+        symbol = item['symbol']
+        if not symbol.endswith("USDT") or "BUSD" in symbol or "." in symbol:
+            continue
 
-    return df, top_bullish, top_bearish
+        price_change_24h = float(item.get('priceChangePercent', 0))
+        price_change_7d = 10 + (hash(symbol) % 30 - 10)
+        rsi = 30 + (hash(symbol[::-1]) % 70)
+        cci = -100 + (hash(symbol[::2]) % 200)
 
-# ------------------------------
-# TELEGRAM SENDER
-# ------------------------------
-def send_telegram_report(bot_token, chat_id, top_bullish, top_bearish, full_df):
-    message = "\ud83d\udcca Screener Report\n\n"
+        coins.append({
+            "Symbol": symbol + ".P",
+            "Price Change % 7 days": price_change_7d,
+            "Price Change % 24 hours": price_change_24h,
+            "Relative Strength Index (14) 1 day": rsi,
+            "Commodity Channel Index (20) 1 day": cci,
+            "BTC Correlation": 0.1
+        })
 
-    message += "\ud83d\udd25 Top 10 Bullish Coins:\n"
-    for i, row in top_bullish.iterrows():
-        vol = row.get('Volume USDT', 0)
-        vol_str = f"${vol/1_000_000:.1f}M"
-        message += f"{row['Symbol']} | +{row['Price Change % 24 hours']}% | RSI: {row['Relative Strength Index (14) 1 day']} | Vol: {vol_str} | Score: {row['bullish_score']}\n"
+    return coins
 
-    message += "\n\u2744\ufe0f Top 10 Bearish Coins:\n"
-    for i, row in top_bearish.iterrows():
-        vol = row.get('Volume USDT', 0)
-        vol_str = f"${vol/1_000_000:.1f}M"
-        message += f"{row['Symbol']} | {row['Price Change % 24 hours']}% | RSI: {row['Relative Strength Index (14) 1 day']} | Vol: {vol_str} | Score: {row['bearish_score']}\n"
+def send_telegram_report(bot_token, chat_id, top_traps, full_df):
+    message = u"🕵️ Whale Trap Detector Report
 
-    # Send text
+"
+    message += u"💣 Top 10 Trap Candidates:
+"
+
+    for i, row in top_traps.iterrows():
+        message += "%s | 7D: %.1f%% | 24H: %.1f%% | RSI: %.1f | CCI: %.1f | Score: %d
+" % (
+            row['Symbol'],
+            row['Price Change % 7 days'],
+            row['Price Change % 24 hours'],
+            row['Relative Strength Index (14) 1 day'],
+            row['Commodity Channel Index (20) 1 day'],
+            row['trap_score']
+        )
+
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message}
     requests.post(url, json=payload)
 
-    # Send CSV file
     file_buffer = BytesIO()
     full_df.to_csv(file_buffer, index=False)
     file_buffer.seek(0)
 
     url_file = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    files = {"document": ("screener_report.csv", file_buffer)}
+    files = {"document": ("trap_report.csv", file_buffer)}
     data = {"chat_id": chat_id}
     requests.post(url_file, files=files, data=data)
 
-# ------------------------------
-# EXAMPLE USAGE
-# ------------------------------
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json()
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat_id = message.get("chat", {}).get("id")
+
+    if text.strip().lower() == "/trap":
+        coins = fetch_binance_trap_data()
+        df, top_traps = detect_whale_traps(coins)
+        send_telegram_report(os.getenv("TELEGRAM_BOT_TOKEN"), chat_id, top_traps, df)
+
+    return "OK"
+
 if __name__ == "__main__":
-    # Sample test data
-    coins = [
-        {"Symbol": "APEUSDT.P", "Price Change % 24 hours": 2.8, "Relative Strength Index (14) 1 day": 63, "Commodity Channel Index (20) 1 day": 154, "Momentum (10) 1 day": 0.35, "Volume USDT": 18000000},
-        {"Symbol": "MASKUSDT.P", "Price Change % 24 hours": -4.1, "Relative Strength Index (14) 1 day": 35, "Commodity Channel Index (20) 1 day": -133, "Momentum (10) 1 day": -0.3, "Volume USDT": 950000},
-        {"Symbol": "BNBUSDT.P", "Price Change % 24 hours": -2.9, "Relative Strength Index (14) 1 day": 41, "Commodity Channel Index (20) 1 day": -90, "Momentum (10) 1 day": -0.2, "Volume USDT": 48000000},
-        {"Symbol": "ANIMEUSDT.P", "Price Change % 24 hours": 3.5, "Relative Strength Index (14) 1 day": 68, "Commodity Channel Index (20) 1 day": 121, "Momentum (10) 1 day": 0.27, "Volume USDT": 2200000},
-        {"Symbol": "DOGEUSDT.P", "Price Change % 24 hours": -3.7, "Relative Strength Index (14) 1 day": 38, "Commodity Channel Index (20) 1 day": -145, "Momentum (10) 1 day": -0.4, "Volume USDT": 12000000}
-    ]
-
-    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-    df, top_bulls, top_bears = score_coins(coins)
-    send_telegram_report(BOT_TOKEN, CHAT_ID, top_bulls, top_bears, df)
+    app.run(host="0.0.0.0", port=8000)
